@@ -186,15 +186,18 @@ def week_start(d):
 def get_true_week_cols(header, s, e):
     dated = [(i, parse_date_cell(v)) for i, v in enumerate(header) if i >= s and i <= e]
     dated = [(i, d) for i, d in dated if d is not None]
-    # Snap to week_start, keep first occurrence per canonical week
-    seen, weeks, prev_ws = {}, [], None
+    # Use week_start for dedup (cross-sheet alignment), but store raw date as key
+    seen_ws = {}  # snapped_monday -> (col_idx, raw_date)
     for i, d in dated:
         ws = week_start(d)
-        if ws not in seen:
-            seen[ws] = i
-            if prev_ws is None or (ws - prev_ws).days >= 6:
-                weeks.append((i, ws))
-                prev_ws = ws
+        if ws not in seen_ws:
+            seen_ws[ws] = (i, d)
+    # Build week list in order, enforce >= 6 day gap on snapped dates
+    weeks, prev_ws = [], None
+    for ws_d, (i, raw_d) in sorted(seen_ws.items()):
+        if prev_ws is None or (ws_d - prev_ws).days >= 6:
+            weeks.append((i, ws_d))  # store snapped date as canonical key
+            prev_ws = ws_d
     return weeks
 
 def parse_customer_sheet(ws_rows, sheet_label):
@@ -489,7 +492,7 @@ with st.sidebar:
     st.markdown('<div class="sb-section">Display Options</div>', unsafe_allow_html=True)
     show_pct = st.toggle("Show % variance", value=True)
 
-active_dates = [d for d in all_dates if d >= start_date]
+active_dates = [d for d in all_dates if d >= week_start(start_date)]
 week_nums    = {d: ((d - start_date).days // 7) + 1 for d in active_dates}
 bucket_dates = {b: [] for b in BUCKET_ORDER}
 for d in active_dates:
