@@ -1,6 +1,6 @@
-[theme]
-primaryColor = "#C00000"
-backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#f7f7f7"
-textColor = "#1A1A1A"
-font = "sans serif"
+streamlit>=1.35.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+numpy>=1.24.0
+plotly>=5.18.0
