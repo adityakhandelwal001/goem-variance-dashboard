@@ -179,34 +179,48 @@ def section_header(text):
     </div>''', unsafe_allow_html=True)
 
 # ── parsing ───────────────────────────────────────────────────────────────────
-def week_start(d):
-    """Snap any date to the Monday of its week — canonical key for cross-sheet alignment."""
-    return d - datetime.timedelta(days=d.weekday())
+def iso_week_key(d):
+    """Return (iso_year, iso_week) as canonical week identifier."""
+    iso = d.isocalendar()
+    return (iso[0], iso[1])
 
 def get_true_week_cols(header, s, e):
+    """
+    Returns list of (col_idx, representative_date) per calendar week.
+    Multiple columns in the same ISO week are merged — first col index is used for reading,
+    but callers should sum all cols in that week (handled in parse functions).
+    """
     dated = [(i, parse_date_cell(v)) for i, v in enumerate(header) if i >= s and i <= e]
     dated = [(i, d) for i, d in dated if d is not None]
-    # Use week_start for dedup (cross-sheet alignment), but store raw date as key
-    seen_ws = {}  # snapped_monday -> (col_idx, raw_date)
+    # Group columns by ISO week, keep all col indices per week
+    week_cols = {}  # iso_week_key -> [col_idx, ...]
+    week_first_date = {}  # iso_week_key -> earliest date in that week
     for i, d in dated:
-        ws = week_start(d)
-        if ws not in seen_ws:
-            seen_ws[ws] = (i, d)
-    # Build week list in order, enforce >= 6 day gap on snapped dates
-    weeks, prev_ws = [], None
-    for ws_d, (i, raw_d) in sorted(seen_ws.items()):
-        if prev_ws is None or (ws_d - prev_ws).days >= 6:
-            weeks.append((i, ws_d))  # store snapped date as canonical key
-            prev_ws = ws_d
-    return weeks
+        wk = iso_week_key(d)
+        if wk not in week_cols:
+            week_cols[wk] = []
+            week_first_date[wk] = d
+        week_cols[wk].append(i)
+        if d < week_first_date[wk]:
+            week_first_date[wk] = d
+    # Sort by week key, enforce >= 6 day gap between representative dates
+    result = []  # list of (week_key, [col_indices], representative_date)
+    prev_date = None
+    for wk in sorted(week_cols.keys()):
+        rep_date = week_first_date[wk]
+        if prev_date is None or (rep_date - prev_date).days >= 6:
+            result.append((wk, week_cols[wk], rep_date))
+            prev_date = rep_date
+    return result  # [(iso_week_key, [col_idxs], rep_date), ...]
 
 def parse_customer_sheet(ws_rows, sheet_label):
     if len(ws_rows) < 3: return [], []
     header = ws_rows[2]
-    dem_weeks = get_true_week_cols(header, 9, 31)
+    dem_weeks = get_true_week_cols(header, 9, 31)   # [(wk_key, [cols], rep_date), ...]
     sup_weeks = get_true_week_cols(header, 32, 54)
-    dem_by_date = {d: i for i, d in dem_weeks}
-    sup_by_date = {d: i for i, d in sup_weeks}
+    # Build date->col_list maps keyed by rep_date
+    dem_by_date = {rep: cols for wk, cols, rep in dem_weeks}
+    sup_by_date = {rep: cols for wk, cols, rep in sup_weeks}
     all_dates = sorted(set(dem_by_date) | set(sup_by_date))
     records = []
     for row in ws_rows[3:]:
@@ -217,13 +231,16 @@ def parse_customer_sheet(ws_rows, sheet_label):
         item  = str(row[7]).strip() if row[7] else ''
         scope = str(row[8]).strip() if row[8] else ''
         if not item or item in ('Shop Order', 'Coolpac Product No.', ''): continue
-        if (sum(safe(row[i]) for i, d in dem_weeks if i < len(row)) == 0 and
-            sum(safe(row[i]) for i, d in sup_weeks if i < len(row)) == 0): continue
+        rd_total = sum(safe(row[c]) for cols in dem_by_date.values() for c in cols if c < len(row))
+        rs_total = sum(safe(row[c]) for cols in sup_by_date.values() for c in cols if c < len(row))
+        if rd_total + rs_total == 0: continue
         rec = {'plant': plant, 'kva': kva, 'model': model, 'item': item, 'scope': scope}
         for d in all_dates:
-            dc = dem_by_date.get(d); sc = sup_by_date.get(d)
-            rec[f'dem_{d}'] = safe(row[dc]) if dc and dc < len(row) else 0.0
-            rec[f'sup_{d}'] = safe(row[sc]) if sc and sc < len(row) else 0.0
+            # Sum all columns in that week
+            dc = dem_by_date.get(d, [])
+            sc = sup_by_date.get(d, [])
+            rec[f'dem_{d}'] = sum(safe(row[c]) for c in dc if c < len(row))
+            rec[f'sup_{d}'] = sum(safe(row[c]) for c in sc if c < len(row))
         records.append(rec)
     return records, all_dates
 
@@ -231,22 +248,26 @@ def parse_mds_sheet(ws_rows):
     if len(ws_rows) < 3: return [], []
     header = ws_rows[2]
     cutoff = datetime.date(2026, 6, 1)
-    # Snap all dates to week_start, pick first col per canonical week, require >= 6 day gap
-    seen = {}
+    # Group by ISO week
+    week_cols = {}; week_first_date = {}
     for i, v in enumerate(header):
         if not isinstance(v, datetime.datetime): continue
         d = v.date()
         if d < cutoff: continue
-        ws = week_start(d)
-        if ws not in seen:
-            seen[ws] = i
-    true_weeks, prev = [], None
-    for ws_d, i in sorted(seen.items()):
-        if prev is None or (ws_d - prev).days >= 6:
-            true_weeks.append((i, ws_d))
-        prev = ws_d
-    date_col = {d: i for i, d in true_weeks}
-    all_dates = sorted(date_col.keys())
+        wk = iso_week_key(d)
+        if wk not in week_cols: week_cols[wk] = []; week_first_date[wk] = d
+        week_cols[wk].append(i)
+        if d < week_first_date[wk]: week_first_date[wk] = d
+    # Build ordered list
+    week_list = []
+    prev_date = None
+    for wk in sorted(week_cols.keys()):
+        rep = week_first_date[wk]
+        if prev_date is None or (rep - prev_date).days >= 6:
+            week_list.append((rep, week_cols[wk]))
+            prev_date = rep
+    date_cols = {rep: cols for rep, cols in week_list}
+    all_dates = sorted(date_cols.keys())
     records = []
     for row in ws_rows[3:]:
         if not row or not row[1]: continue
@@ -259,7 +280,7 @@ def parse_mds_sheet(ws_rows):
                'model': model, 'item': item, 'scope': scope}
         has = False
         for d in all_dates:
-            v = safe(row[date_col[d]]) if date_col[d] < len(row) else 0.0
+            v = sum(safe(row[c]) for c in date_cols[d] if c < len(row))
             rec[f'dem_{d}'] = v; rec[f'sup_{d}'] = 0.0
             if v: has = True
         if has: records.append(rec)
@@ -269,21 +290,24 @@ def parse_plant_sp_sheet(ws_rows):
     if len(ws_rows) < 3: return [], []
     header = ws_rows[2]
     cutoff = datetime.date(2026, 6, 1)
-    seen = {}
+    week_cols = {}; week_first_date = {}
     for i, v in enumerate(header):
         if not isinstance(v, datetime.datetime): continue
         d = v.date()
         if d < cutoff: continue
-        ws = week_start(d)
-        if ws not in seen:
-            seen[ws] = i
-    true_weeks, prev = [], None
-    for ws_d, i in sorted(seen.items()):
-        if prev is None or (ws_d - prev).days >= 6:
-            true_weeks.append((i, ws_d))
-        prev = ws_d
-    date_col = {d: i for i, d in true_weeks}
-    all_dates = sorted(date_col.keys())
+        wk = iso_week_key(d)
+        if wk not in week_cols: week_cols[wk] = []; week_first_date[wk] = d
+        week_cols[wk].append(i)
+        if d < week_first_date[wk]: week_first_date[wk] = d
+    week_list = []
+    prev_date = None
+    for wk in sorted(week_cols.keys()):
+        rep = week_first_date[wk]
+        if prev_date is None or (rep - prev_date).days >= 6:
+            week_list.append((rep, week_cols[wk]))
+            prev_date = rep
+    date_cols = {rep: cols for rep, cols in week_list}
+    all_dates = sorted(date_cols.keys())
     records = []
     for row in ws_rows[3:]:
         if not row or not row[1]: continue
@@ -296,8 +320,7 @@ def parse_plant_sp_sheet(ws_rows):
                'model': model, 'item': item, 'scope': scope}
         has = False
         for d in all_dates:
-            ci = date_col.get(d)
-            v = safe(row[ci]) if ci and ci < len(row) else 0.0
+            v = sum(safe(row[c]) for c in date_cols[d] if c < len(row))
             rec[f'sup_{d}'] = v; rec[f'dem_{d}'] = 0.0
             if v: has = True
         if has: records.append(rec)
@@ -492,7 +515,7 @@ with st.sidebar:
     st.markdown('<div class="sb-section">Display Options</div>', unsafe_allow_html=True)
     show_pct = st.toggle("Show % variance", value=True)
 
-active_dates = [d for d in all_dates if d >= week_start(start_date)]
+active_dates = [d for d in all_dates if d >= start_date]
 week_nums    = {d: ((d - start_date).days // 7) + 1 for d in active_dates}
 bucket_dates = {b: [] for b in BUCKET_ORDER}
 for d in active_dates:
