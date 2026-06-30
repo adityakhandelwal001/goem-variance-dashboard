@@ -649,6 +649,45 @@ merged = [r for r in merged if any(
     for d in active_dates)]
 merged.sort(key=lambda x: (str(x.get('model','')), str(x.get('item',''))))
 
+# ── full-range merge (all_dates, not limited by sidebar start_date) for month-wise table ──
+src_agg_full = {}
+for r in src_combined:
+    key = (r['item'], r['model'], r['kva'], r['scope'])
+    if key not in src_agg_full:
+        src_agg_full[key] = {'item': r['item'], 'model': r['model'],
+                             'kva': r['kva'], 'scope': r['scope']}
+        for d in all_dates:
+            src_agg_full[key][f'src_dem_{d}'] = 0.0
+            src_agg_full[key][f'src_sup_{d}'] = 0.0
+    for d in all_dates:
+        src_agg_full[key][f'src_dem_{d}'] += r.get(f'dem_{d}', 0)
+        src_agg_full[key][f'src_sup_{d}'] += r.get(f'sup_{d}', 0)
+
+ref_agg_full = {}
+for r in ref_recs:
+    key = (r['item'], r['model'], r['kva'], r['scope'])
+    if key not in ref_agg_full:
+        ref_agg_full[key] = {}
+        for d in all_dates:
+            ref_agg_full[key][f'ref_dem_{d}'] = 0.0
+            ref_agg_full[key][f'ref_sup_{d}'] = 0.0
+    for d in all_dates:
+        ref_agg_full[key][f'ref_dem_{d}'] += r.get(f'dem_{d}', 0)
+        ref_agg_full[key][f'ref_sup_{d}'] += r.get(f'sup_{d}', 0)
+
+merged_full = []
+for key in set(src_agg_full) | set(ref_agg_full):
+    row = {**(src_agg_full.get(key, {'item': key[0], 'model': key[1], 'kva': key[2], 'scope': key[3]})),
+           **(ref_agg_full.get(key, {}))}
+    for d in all_dates:
+        row.setdefault(f'src_dem_{d}', 0.0); row.setdefault(f'src_sup_{d}', 0.0)
+        row.setdefault(f'ref_dem_{d}', 0.0); row.setdefault(f'ref_sup_{d}', 0.0)
+    merged_full.append(row)
+merged_full = [r for r in merged_full if any(
+    r.get(f'src_{src_metric}_{d}',0) + r.get(f'ref_{ref_metric}_{d}',0) > 0
+    for d in all_dates)]
+merged_full.sort(key=lambda x: (str(x.get('model','')), str(x.get('item',''))))
+
 # ── filters ───────────────────────────────────────────────────────────────────
 fc1, fc2 = st.columns([2, 2])
 with fc1:
@@ -720,8 +759,8 @@ def export_rows(rows, id_cols):
 # ══════════════════════════════════════════════════════════════════════════════
 # VIEW TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab_charts, tab_kva, tab_bucket, tab_weekly = st.tabs([
-    "Charts & Overview", "kVA Summary", "Bucket Summary", "Week-by-Week Detail"
+tab_charts, tab_kva, tab_bucket, tab_weekly, tab_monthly = st.tabs([
+    "Charts & Overview", "kVA Summary", "Bucket Summary", "Week-by-Week Detail", "Monthly Summary"
 ])
 
 # ── TAB 1: CHARTS ─────────────────────────────────────────────────────────────
@@ -846,3 +885,106 @@ with tab_weekly:
                        data=to_excel_bytes({"Weekly Detail": df_w, "Bucket Summary": df_bucket,
                                             "kVA Summary": df_kva}),
                        file_name="goem_full_variance.xlsx")
+
+# ── TAB 5: MONTHLY SUMMARY ────────────────────────────────────────────────────
+with tab_monthly:
+    st.markdown('<div class="cmp-label" style="margin-top:4px">Month Range</div>', unsafe_allow_html=True)
+    mc1, mc2 = st.columns(2)
+    min_d, max_d = min(all_dates), max(all_dates)
+    with mc1:
+        month_start = st.date_input("From", value=min_d, min_value=min_d, max_value=max_d, key="month_start")
+    with mc2:
+        month_end = st.date_input("To", value=max_d, min_value=min_d, max_value=max_d, key="month_end")
+
+    if month_start > month_end:
+        st.warning("Start date must be before end date.")
+    else:
+        range_dates = [d for d in all_dates if month_start <= d <= month_end]
+
+        if not range_dates:
+            st.info("No data in the selected range.")
+        else:
+            # Group dates by (year, month)
+            month_groups = {}
+            for d in range_dates:
+                mk = (d.year, d.month)
+                month_groups.setdefault(mk, []).append(d)
+            month_keys = sorted(month_groups.keys())
+            month_labels = [datetime.date(y, m, 1).strftime('%b %Y') for y, m in month_keys]
+
+            st.caption(f"**{len(merged_full)} items** · {src_metric_label} vs {ref_metric_label} · "
+                      f"{month_start.strftime('%d %b %Y')} – {month_end.strftime('%d %b %Y')} "
+                      f"({len(month_keys)} months)")
+
+            # Totals row data
+            month_totals = {mk: [0.0, 0.0] for mk in month_keys}
+            grand_src = grand_ref = 0.0
+
+            # Build table
+            h = '<div style="overflow-x:auto"><table class="var-table"><thead><tr>'
+            h += '<th class="left" rowspan="2">Item No</th><th class="left" rowspan="2">Model</th>'
+            h += '<th class="left" rowspan="2">kVA</th><th class="left" rowspan="2">Scope</th>'
+            for lbl in month_labels:
+                h += f'<th colspan="3" style="border-left:2px solid #444">{lbl}</th>'
+            h += '<th colspan="3" style="border-left:3px solid #C00000;background:#2a0000">Range Total</th>'
+            h += '</tr><tr>'
+            for _ in month_labels:
+                h += f'<th style="border-left:1px solid #3a3a3a">{src_col_label[:10]}</th><th>{ref_col_label[:10]}</th><th>Variance</th>'
+            h += f'<th style="border-left:3px solid #C00000;background:#fff0f0">{src_col_label[:10]}</th><th style="background:#fff0f0">{ref_col_label[:10]}</th><th style="background:#fff0f0">Variance</th>'
+            h += '</tr></thead><tbody>'
+
+            body = ''
+            for r in merged_full:
+                cells = (f'<td class="left">{r.get("item","")}</td><td class="left">{r.get("model","")}</td>'
+                        f'<td class="left">{r.get("kva","")}</td><td class="left">{r.get("scope","")}</td>')
+                row_src_total = row_ref_total = 0.0
+                for mk in month_keys:
+                    dates_m = month_groups[mk]
+                    a  = sum(r.get(f'src_{src_metric}_{d}', 0) for d in dates_m)
+                    bv = sum(r.get(f'ref_{ref_metric}_{d}', 0) for d in dates_m)
+                    month_totals[mk][0] += a; month_totals[mk][1] += bv
+                    row_src_total += a; row_ref_total += bv
+                    vc, vt = var_td(a, bv, show_pct)
+                    cells += f'<td style="border-left:1px solid #eee">{fmt(a)}</td><td>{fmt(bv)}</td><td class="{vc}">{vt}</td>'
+                grand_src += row_src_total; grand_ref += row_ref_total
+                vc, vt = var_td(row_src_total, row_ref_total, show_pct)
+                cells += (f'<td style="border-left:3px solid #C00000;background:#fff8f8"><strong>{fmt(row_src_total)}</strong></td>'
+                         f'<td style="background:#fff8f8"><strong>{fmt(row_ref_total)}</strong></td>'
+                         f'<td class="{vc}" style="background:#fff8f8"><strong>{vt}</strong></td>')
+                body += f'<tr>{cells}</tr>'
+
+            tcells = '<td class="left" colspan="4"><strong>TOTAL</strong></td>'
+            for mk in month_keys:
+                ta, tb = month_totals[mk]
+                vc, vt = var_td(ta, tb, show_pct)
+                tcells += f'<td style="border-left:1px solid #eee"><strong>{fmt(ta)}</strong></td><td><strong>{fmt(tb)}</strong></td><td class="{vc}"><strong>{vt}</strong></td>'
+            vc, vt = var_td(grand_src, grand_ref, show_pct)
+            tcells += (f'<td style="border-left:3px solid #C00000;background:#fff0f0"><strong>{fmt(grand_src)}</strong></td>'
+                      f'<td style="background:#fff0f0"><strong>{fmt(grand_ref)}</strong></td>'
+                      f'<td class="{vc}" style="background:#fff0f0"><strong>{vt}</strong></td>')
+            body += f'<tr class="total-row">{tcells}</tr>'
+
+            st.markdown(h + body + '</tbody></table></div>', unsafe_allow_html=True)
+
+            # Excel export
+            exp_m = []
+            for r in merged_full:
+                row_out = {'Item No': r.get('item',''), 'Model': r.get('model',''),
+                          'kVA': r.get('kva',''), 'Scope': r.get('scope','')}
+                row_src_total = row_ref_total = 0.0
+                for mk, lbl in zip(month_keys, month_labels):
+                    dates_m = month_groups[mk]
+                    a  = sum(r.get(f'src_{src_metric}_{d}', 0) for d in dates_m)
+                    bv = sum(r.get(f'ref_{ref_metric}_{d}', 0) for d in dates_m)
+                    row_src_total += a; row_ref_total += bv
+                    row_out[f'{lbl} {src_col_label}'] = int(a)
+                    row_out[f'{lbl} {ref_col_label}'] = int(bv)
+                    row_out[f'{lbl} Variance']          = int(a - bv)
+                row_out[f'Range Total {src_col_label}'] = int(row_src_total)
+                row_out[f'Range Total {ref_col_label}'] = int(row_ref_total)
+                row_out['Range Total Variance']          = int(row_src_total - row_ref_total)
+                exp_m.append(row_out)
+            df_monthly = pd.DataFrame(exp_m)
+            st.download_button("Export Monthly Summary",
+                               data=to_excel_bytes({"Monthly Summary": df_monthly}),
+                               file_name="goem_monthly_variance.xlsx")
